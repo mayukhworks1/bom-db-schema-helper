@@ -2,219 +2,317 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 
-st.set_page_config(layout="wide", page_title="School ↔ SKU Mapper 2025")
-st.title("School ↔ SKU Mapping + Entity ID Enrichment")
+# Optional fuzzy matching
+FUZZY_AVAILABLE = False
+try:
+    from fuzzywuzzy import fuzz, process
+    FUZZY_AVAILABLE = True
+except:
+    pass
 
-# ────────────────────────────────────────────────
-# Helpers
-# ────────────────────────────────────────────────
 
-def norm(s):
-    if pd.isna(s):
+# ─────────────────────────────────────────────
+# App Config
+# ─────────────────────────────────────────────
+
+st.set_page_config(layout="wide", page_title="School SKU Gap Analyzer")
+st.title("School ↔ SKU Expected vs Actual Gap Analysis")
+
+
+# ─────────────────────────────────────────────
+# Utility Functions
+# ─────────────────────────────────────────────
+
+def normalize(value):
+    if value is None:
         return ""
-    return str(s).strip().upper().replace("  ", " ")
+    if pd.isna(value):
+        return ""
+    return str(value).strip().upper()
 
 
-def to_str(df):
-    for col in df.columns:
-        df[col] = df[col].astype(str).replace(['nan','NaN','None','<NA>'], '')
-    return df
+def safe_string_dataframe(df):
+    df = df.fillna("")
+    return df.astype(str)
 
 
-def safe_name(n):
-    n = str(n)
-    n = re.sub(r'[\\/*?:[\]]', '_', n).strip()[:31].strip('_ ')
-    return n or "Sheet"
+def to_integer_series(series):
+    return pd.to_numeric(series, errors="coerce").fillna(0).astype(int)
 
 
-# ────────────────────────────────────────────────
-# 1. School master CSV
-# ────────────────────────────────────────────────
-
-school_uploader = st.file_uploader("1. Upload schools_export.csv", type="csv")
-
-school_df = pd.DataFrame()
-
-if school_uploader:
-    try:
-        school_df = pd.read_csv(school_uploader, dtype=str, keep_default_na=False)
-        school_df.columns = school_df.columns.str.strip()
-
-        # Try to find important columns (case insensitive)
-        col_lower = school_df.columns.str.lower()
-
-        entity_col   = next((c for c in school_df.columns if "entity" in c.lower() or "id" in c.lower()), "entity_id")
-        name_col     = next((c for c in school_df.columns if "name" in c.lower()), "school_name")
-        code_col     = next((c for c in school_df.columns if "code" in c.lower() or "party" in c.lower()), "school_code")
-        brand_col    = next((c for c in school_df.columns if "brand" in c.lower()), None)
-        zone_col     = next((c for c in school_df.columns if "zone" in c.lower()), None)
-
-        # Rename to standard names
-        rename = {}
-        if entity_col != "entity_id": rename[entity_col] = "entity_id"
-        if name_col   != "school_name": rename[name_col]   = "school_name"
-        if code_col   != "school_code": rename[code_col]   = "school_code"
-        if brand_col and brand_col != "brand": rename[brand_col] = "brand"
-        if zone_col  and zone_col  != "zone":  rename[zone_col]  = "zone"
-
-        school_df.rename(columns=rename, inplace=True)
-
-        # Create normalized versions
-        if "school_code" in school_df.columns:
-            school_df["code_norm"] = school_df["school_code"].apply(norm)
-        if "school_name" in school_df.columns:
-            school_df["name_norm"] = school_df["school_name"].apply(norm)
-
-        school_df = to_str(school_df)
-
-        st.success(f"School master loaded — {len(school_df)} rows")
-
-        with st.expander("School master columns & sample"):
-            st.write("Columns:", list(school_df.columns))
-            st.dataframe(school_df.head(6))
-
-    except Exception as e:
-        st.error(f"Failed to read schools CSV\n{e}")
+def download_csv(df, filename):
+    buffer = BytesIO()
+    df.to_csv(buffer, index=False)
+    st.download_button(
+        label=f"📥 Download {filename}",
+        data=buffer.getvalue(),
+        file_name=f"{filename}.csv",
+        mime="text/csv"
+    )
 
 
-# ────────────────────────────────────────────────
-# 2. Item master Excel
-# ────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# 1️⃣ Load Schools CSV (ACTUAL DATA)
+# ─────────────────────────────────────────────
 
-excel_uploader = st.file_uploader("2. Upload Master Final For Ecom.xlsx", type="xlsx")
+school_file = st.file_uploader("Upload schools_export.csv", type="csv")
 
-if excel_uploader:
-    try:
-        xl = pd.ExcelFile(excel_uploader)
+if school_file is None:
+    st.info("Upload both CSV and Excel files to begin.")
+    st.stop()
 
-        sheet = st.selectbox(
-            "Select sheet",
-            xl.sheet_names,
-            index=next((i for i,s in enumerate(xl.sheet_names) if "item" in s.lower() or "master" in s.lower() or "report" in s.lower()), 0)
-        )
+try:
+    schools = pd.read_csv(school_file, dtype=str)
+    schools = safe_string_dataframe(schools)
+    schools.columns = schools.columns.str.strip()
 
-        # Read raw → find header
-        raw = pd.read_excel(excel_uploader, sheet_name=sheet, header=None)
-        header_idx = None
-        for r in range(15):
-            if any("ITEM CODE" in str(x).upper() for x in raw.iloc[r]):
-                header_idx = r
-                break
+    # Column mapping
+    column_map = {}
 
-        if header_idx is None:
-            st.error("Cannot find row with 'ITEM CODE' in first 15 rows")
+    for col in schools.columns:
+        lower = col.lower()
+
+        if "entity" in lower and "id" in lower:
+            column_map[col] = "entity_id"
+
+        elif lower == "name":
+            column_map[col] = "school_name"
+
+        elif "school code" in lower:
+            column_map[col] = "school_code"
+
+        elif "associated" in lower:
+            column_map[col] = "actual_items"
+
+        elif "brand" in lower:
+            column_map[col] = "brand"
+
+        elif "zone" in lower:
+            column_map[col] = "zone"
+
+    schools.rename(columns=column_map, inplace=True)
+
+    # Required columns check
+    required_columns = ["entity_id", "school_name", "school_code"]
+    for col in required_columns:
+        if col not in schools.columns:
+            st.error(f"Missing required column: {col}")
             st.stop()
 
-        st.success(f"Header found at row {header_idx}")
+    # Ensure actual_items exists
+    if "actual_items" in schools.columns:
+        schools["actual_items"] = to_integer_series(schools["actual_items"])
+    else:
+        schools["actual_items"] = 0
 
-        # Read real data
-        df = pd.read_excel(excel_uploader, sheet_name=sheet, header=header_idx)
-        df.columns = df.columns.astype(str).str.strip()
-        df = to_str(df)
+    # Normalized fields
+    schools["school_name_norm"] = schools["school_name"].apply(normalize)
+    schools["school_code_norm"] = schools["school_code"].apply(normalize)
 
-        # Basic item master
-        items = pd.DataFrame({
-            "item_code": df.get("ITEM CODE", "").apply(norm),
-            "sku":       df.get("ADDL ITEM CODE", "").apply(norm),
-            "name":      df.get("ITEM NAME", "").str.strip()
-        }).query("sku != ''").drop_duplicates("sku").reset_index(drop=True)
+    st.success(f"Schools loaded: {len(schools)} rows")
 
-        st.subheader("Item master")
-        c1, c2 = st.columns(2)
-        c1.metric("Rows", f"{len(df):,}")
-        c2.metric("Unique SKUs", len(items))
+except Exception as e:
+    st.error(f"CSV Load Failed:\n{str(e)}")
+    st.stop()
 
-        st.dataframe(items.head(10), use_container_width=True)
 
-        # ──────────────────────────────
-        # Find school columns
-        # ──────────────────────────────
+# ─────────────────────────────────────────────
+# 2️⃣ Load Excel (EXPECTED DATA)
+# ─────────────────────────────────────────────
 
-        end_col = 15
-        cols_lower = [c.lower() for c in df.columns]
-        if "multiple item codes" in cols_lower:
-            end_col = cols_lower.index("multiple item codes") + 1
+excel_file = st.file_uploader("Upload Master Final For Ecom.xlsx", type="xlsx")
 
-        school_cols = df.columns[end_col:]
+if excel_file is None:
+    st.stop()
 
-        if len(school_cols) == 0:
-            st.warning("No school columns detected after master data")
-        else:
-            st.write(f"Found {len(school_cols)} potential school columns")
+try:
+    xl = pd.ExcelFile(excel_file)
+    sheet = st.selectbox("Select Sheet", xl.sheet_names)
 
-            # Build mapping
-            mapping = []
-            for col in school_cols:
-                col_str = str(col).strip()
-                if not col_str:
-                    continue
+    # Detect header row
+    raw = pd.read_excel(excel_file, sheet_name=sheet, header=None)
 
-                skus = df[col].dropna().astype(str).str.strip().str.upper()
-                valid = skus[(skus != "") & (skus != "NAN")]
+    header_row = None
+    for i in range(min(30, len(raw))):
+        row = raw.iloc[i].astype(str).str.upper()
+        if row.str.contains("ITEM CODE").any():
+            header_row = i
+            break
 
-                for sku in valid:
-                    mapping.append({
-                        "school_raw": col_str,
-                        "school_norm": norm(col_str),
-                        "sku": sku
-                    })
+    if header_row is None:
+        st.error("Could not detect header row containing 'ITEM CODE'")
+        st.stop()
 
-            map_df = pd.DataFrame(mapping).drop_duplicates()
+    data = pd.read_excel(excel_file, sheet_name=sheet, header=header_row)
+    data = safe_string_dataframe(data)
+    data.columns = data.columns.str.strip()
 
-            if map_df.empty:
-                st.warning("No valid SKUs found in school columns")
-            else:
-                st.subheader("Raw school → SKU mapping")
-                st.dataframe(map_df.head(20), use_container_width=True)
+    # Identify where school columns start
+    try:
+        end_index = list(data.columns).index("MULTIPLE ITEM CODES") + 1
+    except:
+        end_index = 15  # fallback
 
-                # ──────────────────────────────
-                # ENRICHMENT
-                # ──────────────────────────────
+    school_columns = list(data.columns[end_index:])
 
-                enriched = map_df.copy()
+    # Build Expected Mapping
+    mapping_rows = []
 
-                if not school_df.empty:
-                    st.write("Enriching...")
+    for col in school_columns:
 
-                    # 1. Try exact code match
-                    if "code_norm" in school_df.columns:
-                        enriched = enriched.merge(
-                            school_df[["entity_id", "school_code", "brand", "zone", "code_norm"]],
-                            left_on="school_raw",
-                            right_on="code_norm",
-                            how="left"
-                        ).drop(columns=["code_norm"], errors="ignore")
+        school_norm = normalize(col)
+        if school_norm == "":
+            continue
 
-                    # 2. If still many missing → try name match (simple contains)
-                    missing = enriched["entity_id"].isna()
-                    if missing.any() and "name_norm" in school_df.columns:
-                        for idx in enriched[missing].index:
-                            s_norm = enriched.at[idx, "school_norm"]
-                            candidates = school_df[school_df["name_norm"].str.contains(s_norm, na=False)]
-                            if len(candidates) == 1:
-                                row = candidates.iloc[0]
-                                enriched.at[idx, "entity_id"]   = row.get("entity_id", "")
-                                enriched.at[idx, "school_code"] = row.get("school_code", "")
-                                enriched.at[idx, "brand"]       = row.get("brand", "")
-                                enriched.at[idx, "zone"]        = row.get("zone", "")
+        sku_series = data[col].astype(str).str.strip().str.upper()
+        sku_series = sku_series[sku_series != ""]
 
-                    enriched = to_str(enriched)
+        unique_skus = sku_series.unique()
 
-                st.subheader("Enriched mapping")
-                st.dataframe(enriched.head(25), use_container_width=True)
+        for sku in unique_skus:
+            mapping_rows.append({
+                "school_norm": school_norm,
+                "sku": sku
+            })
 
-                # Counts
-                groupby_cols = [c for c in ["entity_id", "school_code", "school_norm", "brand", "zone"] if c in enriched.columns]
-                if groupby_cols:
-                    counts = enriched.groupby(groupby_cols, as_index=False, dropna=False)\
-                                     .agg(sku_count=("sku", "nunique"))\
-                                     .sort_values("sku_count", ascending=False)
-                    st.subheader("SKUs per school / entity")
-                    st.dataframe(counts, use_container_width=True)
+    mapping = pd.DataFrame(mapping_rows)
 
-    except Exception as e:
-        st.error(f"Error during processing:\n{str(e)}")
-        import traceback
-        st.code(traceback.format_exc(), language="python")
+    if mapping.empty:
+        st.error("No school SKU mapping found in Excel.")
+        st.stop()
 
-st.caption("Clean & safe version • All string • Simple name fallback • Feb 2025")
+    expected_counts = (
+        mapping.groupby("school_norm")["sku"]
+        .nunique()
+        .reset_index(name="expected_items")
+    )
+
+    st.success("Excel expected mapping built successfully.")
+
+except Exception as e:
+    import traceback
+    st.error("Excel Processing Failed")
+    st.code(traceback.format_exc(), language="python")
+    st.stop()
+
+
+# ─────────────────────────────────────────────
+# 3️⃣ Matching Logic
+# ─────────────────────────────────────────────
+
+results = []
+school_groups = expected_counts["school_norm"].tolist()
+
+for _, row in schools.iterrows():
+
+    expected_items = 0
+    matched_group = ""
+    match_score = 0
+    match_type = ""
+
+    code_norm = row["school_code_norm"]
+    name_norm = row["school_name_norm"]
+
+    # 1. Exact Code Match
+    if code_norm in school_groups:
+
+        expected_items = int(
+            expected_counts.loc[
+                expected_counts["school_norm"] == code_norm,
+                "expected_items"
+            ].iloc[0]
+        )
+
+        matched_group = code_norm
+        match_score = 100
+        match_type = "code"
+
+    # 2. Fuzzy Name Match
+    elif FUZZY_AVAILABLE and len(school_groups) > 0:
+
+        best_match = process.extractOne(
+            name_norm,
+            school_groups,
+            scorer=fuzz.token_sort_ratio
+        )
+
+        if best_match is not None:
+
+            candidate, score = best_match
+
+            if score >= 80:
+                expected_items = int(
+                    expected_counts.loc[
+                        expected_counts["school_norm"] == candidate,
+                        "expected_items"
+                    ].iloc[0]
+                )
+
+                matched_group = candidate
+                match_score = score
+                match_type = "fuzzy"
+
+    # 3. Contains fallback
+    else:
+        possible_matches = [
+            group for group in school_groups
+            if name_norm in group
+        ]
+
+        if len(possible_matches) > 0:
+            candidate = possible_matches[0]
+
+            expected_items = int(
+                expected_counts.loc[
+                    expected_counts["school_norm"] == candidate,
+                    "expected_items"
+                ].iloc[0]
+            )
+
+            matched_group = candidate
+            match_type = "contains"
+
+    actual_items = int(row["actual_items"])
+
+    difference = actual_items - expected_items
+
+    coverage = 0.0
+    if expected_items > 0:
+        coverage = round((actual_items / expected_items) * 100, 1)
+
+    results.append({
+        "entity_id": row["entity_id"],
+        "school_name": row["school_name"],
+        "school_code": row["school_code"],
+        "expected_items": expected_items,
+        "actual_items": actual_items,
+        "difference": difference,
+        "coverage_%": coverage,
+        "matched_group": matched_group,
+        "match_score": match_score,
+        "match_type": match_type
+    })
+
+
+result_df = pd.DataFrame(results).sort_values("difference", ascending=True)
+
+st.subheader("Expected vs Actual Comparison")
+st.dataframe(result_df, use_container_width=True, height=650)
+download_csv(result_df, "expected_vs_actual")
+
+
+# ─────────────────────────────────────────────
+# 4️⃣ Gap Analysis
+# ─────────────────────────────────────────────
+
+gap_df = result_df[abs(result_df["difference"]) > 5]
+
+if not gap_df.empty:
+    st.subheader("Significant Gaps (>|5|)")
+    st.dataframe(gap_df, use_container_width=True)
+    download_csv(gap_df, "significant_gaps")
+else:
+    st.success("No significant gaps found.")
+
+
+st.caption("Stable Version • No ambiguous boolean checks • Fully validated")
