@@ -143,7 +143,7 @@ try:
         st.error("Could not detect header row containing 'ITEM CODE'")
         st.stop()
 
-    data = pd.read_excel(excel_file, sheet_name=sheet, header=header_row)
+    data = pd.read_excel(excel_file, sheet_name=sheet, header=header_row, engine='openpyxl')
     data = safe_string_dataframe(data)
     data.columns = data.columns.str.strip()
 
